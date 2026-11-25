@@ -328,3 +328,139 @@ CREATE TABLE IF NOT EXISTS load_count (
     capacity       INTEGER,
     load_factor    DOUBLE PRECISION
 );
+
+-- ============================ 线路班次可执行性分析 ============================
+-- 该模块独立于 4 周实验的 service_trip/actual_service_run，自带 6 周规则时刻表与 AVL，
+-- 避免把可执行性样例计入实验护栏与效应估计口径。
+
+-- 车辆台账（样例：每线路 4 辆）
+CREATE TABLE IF NOT EXISTS fleet_vehicle (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    vehicle_code   TEXT NOT NULL,          -- R1-V1 ...
+    route_code     TEXT NOT NULL,
+    depot_code     TEXT NOT NULL,
+    capacity       INTEGER NOT NULL DEFAULT 80,
+    UNIQUE (experiment_id, vehicle_code)
+);
+
+-- 司机排班（司机换班点挂在车辆块上）
+CREATE TABLE IF NOT EXISTS driver_shift (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    shift_code     TEXT NOT NULL,         -- R1-S-001
+    driver_code    TEXT NOT NULL,
+    route_code     TEXT NOT NULL,
+    service_date   DATE NOT NULL,
+    shift_start    TIMESTAMPTZ NOT NULL,
+    shift_end      TIMESTAMPTZ NOT NULL,
+    relief_vehicle_code TEXT,             -- 换班时接手的车辆
+    relief_ts      TIMESTAMPTZ,           -- 司机换班时刻
+    UNIQUE (experiment_id, shift_code)
+);
+CREATE INDEX IF NOT EXISTS idx_shift_route_date ON driver_shift(experiment_id, route_code, service_date);
+
+-- 车辆块账：一辆车一个运营日内的连续车次链（含换班接续）
+CREATE TABLE IF NOT EXISTS vehicle_block (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    block_code     TEXT NOT NULL,         -- BLK-R1-20260706-V1
+    vehicle_code   TEXT NOT NULL,
+    route_code     TEXT NOT NULL,
+    service_date   DATE NOT NULL,
+    block_start    TIMESTAMPTZ NOT NULL,
+    block_end      TIMESTAMPTZ NOT NULL,
+    shift_codes    TEXT NOT NULL DEFAULT '', -- 逗号分隔，体现司机换班
+    UNIQUE (experiment_id, block_code)
+);
+CREATE INDEX IF NOT EXISTS idx_block_route_date ON vehicle_block(experiment_id, route_code, service_date);
+
+-- 可执行性分析专用规则时刻表（6 周，周一至周五）
+CREATE TABLE IF NOT EXISTS feasibility_trip (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    trip_code      TEXT NOT NULL,         -- FT-R1-20260706-001
+    route_code     TEXT NOT NULL,
+    direction      TEXT NOT NULL,         -- OUTBOUND/INBOUND
+    service_date   DATE NOT NULL,
+    week_index     INTEGER NOT NULL,      -- 1..6
+    seq_in_day     INTEGER NOT NULL,
+    period_band    TEXT NOT NULL,         -- AM_PEAK/PM_PEAK/OFF_PEAK
+    scheduled_departure TIMESTAMPTZ NOT NULL,
+    headway_seconds INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'OPERATED', -- OPERATED/LATE/MISSED/SUSPENDED
+    block_id       BIGINT REFERENCES vehicle_block(id) ON DELETE SET NULL,
+    UNIQUE (experiment_id, trip_code)
+);
+CREATE INDEX IF NOT EXISTS idx_ftrip_route_day ON feasibility_trip(experiment_id, route_code, service_date);
+
+-- 车辆块与计划车次的连接账（车辆排班账把车次连接到车辆块与司机换班）
+CREATE TABLE IF NOT EXISTS block_trip_link (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    block_id       BIGINT NOT NULL REFERENCES vehicle_block(id) ON DELETE CASCADE,
+    trip_id        BIGINT NOT NULL REFERENCES feasibility_trip(id) ON DELETE CASCADE,
+    seq_in_block   INTEGER NOT NULL,
+    shift_code     TEXT,
+    UNIQUE (experiment_id, trip_id)
+);
+
+-- AVL 行程分段：运行时间 / 终点恢复 / 折返 / 空驶
+CREATE TABLE IF NOT EXISTS avl_segment (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    trip_id        BIGINT NOT NULL REFERENCES feasibility_trip(id) ON DELETE CASCADE,
+    segment_index  INTEGER NOT NULL,
+    segment_type   TEXT NOT NULL,         -- RUNNING/TERMINAL_RECOVERY/TURNBACK/DEADHEAD
+    from_stop      TEXT,
+    to_stop        TEXT,
+    direction      TEXT NOT NULL,         -- OUTBOUND/INBOUND
+    planned_seconds  INTEGER NOT NULL,
+    observed_seconds INTEGER NOT NULL,
+    anomaly_flag   BOOLEAN NOT NULL DEFAULT FALSE, -- 封路/停运等非常态观测
+    anomaly_reason TEXT,
+    UNIQUE (experiment_id, trip_id, segment_index)
+);
+CREATE INDEX IF NOT EXISTS idx_avl_route_day ON avl_segment(experiment_id, segment_type, anomaly_flag);
+
+-- 周期时间观测：同线路同方向历史完整行程（运行+终点恢复+折返，空驶单列），供不确定性估计器建分布
+CREATE TABLE IF NOT EXISTS cycle_time_observation (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    route_code     TEXT NOT NULL,
+    direction      TEXT NOT NULL,
+    service_date   DATE NOT NULL,
+    week_index     INTEGER NOT NULL,
+    trip_id        BIGINT NOT NULL REFERENCES feasibility_trip(id) ON DELETE CASCADE,
+    block_id       BIGINT REFERENCES vehicle_block(id) ON DELETE SET NULL,
+    running_seconds    INTEGER NOT NULL,
+    recovery_seconds   INTEGER NOT NULL,
+    turnback_seconds   INTEGER NOT NULL,
+    deadhead_seconds   INTEGER NOT NULL DEFAULT 0,
+    cycle_seconds      INTEGER NOT NULL, -- 运行+恢复+折返（不含空驶）
+    excluded       BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE=节庆/封路留出，不进常态分布
+    exclude_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cycle_route_dir ON cycle_time_observation(experiment_id, route_code, direction, excluded);
+
+-- 可行性报告（两种估计路线各一行，可重复生成、留痕审计）
+CREATE TABLE IF NOT EXISTS feasibility_report (
+    id             BIGSERIAL PRIMARY KEY,
+    experiment_id  BIGINT NOT NULL REFERENCES experiment(id) ON DELETE CASCADE,
+    route_code     TEXT NOT NULL,
+    method         TEXT NOT NULL,         -- QUANTILE / BLOCK_RESAMPLE
+    fleet_size     INTEGER NOT NULL,
+    holdout_week   INTEGER,               -- 留出周（节庆封路周）；NULL 表示全量
+    on_time_rate   DOUBLE PRECISION NOT NULL,
+    missed_trip_rate DOUBLE PRECISION NOT NULL,
+    scheduled_trips INTEGER NOT NULL,
+    on_time_trips  INTEGER NOT NULL,
+    missed_trips   INTEGER NOT NULL,
+    late_trips     INTEGER NOT NULL DEFAULT 0,
+    peak_vehicles_needed INTEGER NOT NULL,
+    feasible       BOOLEAN NOT NULL,      -- 缺班=0 才允许 TRUE
+    breakpoints    TEXT,                  -- JSON 数组：断点原因明细
+    method_config  TEXT,                  -- JSON：分位数/重采样参数，易审计
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_feas_exp ON feasibility_report(experiment_id, route_code, method);

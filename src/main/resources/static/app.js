@@ -93,6 +93,7 @@ const TAB_TITLES = {
   exposure: ['暴露路径台账', '逐段关联计划分配、GPS 实际运行、折返/加班偏离与完整路径'],
   support: ['共同支持', '按时段 × 起讫区间 × 天气 × 可达性检查两臂可比范围'],
   analysis: ['客流结果估计', '乘客旅程加权 ITT、跨线暴露、CACE 与随机化推断区间'],
+  feasibility: ['线路班次可执行性', 'AVL 四段分解、车辆块/司机换班账、周期时间分布与给定车队数可行性报告'],
   guardrails: ['投诉与满载护栏', '独立于平均候车改善；任一硬护栏超限即停止扩围'],
   review: ['离线审阅', '冻结证据包、确定性复算与完整 JSON 导出'],
   expansion: ['扩围证据', '主要指标 + 护栏证据形成 GO / HOLD / BLOCKED 结论']
@@ -601,6 +602,203 @@ function ciBlock(rows, title) {
         <div class="ci-dot ${cross ? 'zero-cross' : ''}" style="left:${dot}%"></div>
       </div>
       <div class="small mono">${fmt(r.estimate, 1)} [${fmt(r.ci_low, 1)}, ${fmt(r.ci_high, 1)}]</div>
+    </div>`;
+  }).join('');
+}
+
+/* ---------------- 线路班次可执行性 ---------------- */
+const FEAS_BP_META = {
+  FLEET_SHORTAGE: ['车辆周转不足·丢班', 'red'],
+  CYCLE_BUFFER_SHORTFALL: ['周期缓冲不足·级联晚点', 'amber'],
+  RUNNING_OVERRUN: ['运行时间超计划', 'amber'],
+  RECOVERY_OVERRUN: ['终点恢复不足', 'amber'],
+  TURNBACK_INSUFFICIENT: ['折返时间不足', 'amber'],
+  DRIVER_RELIEF_GAP: ['司机换班缺口', 'red'],
+  DEADHEAD_PULLOUT_DELAY: ['出场空驶延误', 'amber']
+};
+
+RENDER.feasibility = async function () {
+  const ov = await api(`/experiments/${EXP.id}/feasibility/overview`);
+  const holdout = ov.holdout || {};
+  const counts = Object.fromEntries((ov.counts || []).map(c => [c.table_name, c.n]));
+  $('#tab-feasibility').innerHTML = `
+    <div class="banner amber"><span class="big">🚌</span><div>
+      <b>纸面间隔满足 ≠ 可执行。</b>仿真按给定车队数做车辆周转：无车在容忍窗口内接车即记缺班；
+      只要缺班 &gt; 0，<b>feasible 强制为 FALSE</b>，不得把纸面车次齐全宣称可执行。
+      <div class="small">AVL 把行程拆成运行/终点恢复/折返/空驶；车辆块把车次连到车辆与司机换班；
+      周期时间分布只使用常态周，节庆封路周（第 ${holdout.holdoutWeek || 6} 周）整周留出。</div>
+    </div></div>
+
+    <div class="grid cards-4">
+      ${stat('线路 / 每线车辆', (ov.fleet || []).map(f => f.route_code + '=' + f.vehicles).join(' · '), '车队台账 fleet_vehicle')}
+      ${stat('规则时刻表车次', counts.feasibility_trip ?? 0, '6 周 × 3 线路 × 周一至五')}
+      ${stat('车辆块 / 司机班次', (counts.vehicle_block ?? 0) + ' / ' + (counts.driver_shift ?? 0), '块内含 AM/PM 换班点')}
+      ${stat('AVL 分段 / 留出观测', (counts.avl_segment ?? 0) + ' / ' + (counts.cycle_excluded ?? 0), '封路节庆不进常态分布', 'red')}
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>🧪 节庆封路留出周</h3>
+      <p class="section-desc">封路窗口 <b>${holdout.closureWindow || '—'}</b>，仅一周且含临时封路；
+      该周全部周期观测 excluded=TRUE，两种估计路线的常态分布与重采样运行日均不得包含它。</p>
+      <table class="data"><thead><tr><th>线路</th><th class="num">整周留出</th><th class="num">封路窗口观测</th>
+      <th class="num">封路最大周期(s)</th><th class="num">常态最大周期(s)</th></tr></thead><tbody>
+      ${(holdout.routes || []).map(r => `<tr><td>${r.route_code}</td>
+        <td class="num mono">${r.excluded_samples}</td>
+        <td class="num mono">${r.closure_samples}</td>
+        <td class="num mono" style="color:var(--red)">${fmt(r.closure_max_cycle, 0)}</td>
+        <td class="num mono">${fmt(r.normal_max_cycle, 0)}</td></tr>`).join('')}
+      </tbody></table>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>⚙️ 运行可行性报告</h3>
+      <div class="toolbar">
+        <label>线路 <select id="feas-route">${['R1', 'R2', 'R3'].map(r => `<option>${r}</option>`).join('')}</select></label>
+        <label>车队数 <input id="feas-fleet" type="number" value="4" min="1" max="12" style="width:80px"/></label>
+        <label>分位数 <input id="feas-q" type="number" value="0.90" min="0.5" max="0.99" step="0.05" style="width:90px"/></label>
+        <label>评估范围 <select id="feas-holdout">
+          <option value="">常态周全量</option>
+          <option value="6">仅节庆留出周（第 6 周，含真实重放对照）</option>
+        </select></label>
+        <button class="btn primary" id="feas-run">▶ 运行两方案分析</button>
+        <span id="feas-run-out" class="small"></span>
+      </div>
+      <div id="feas-results" class="small muted">选择参数后点击运行。分位数法易审计但不表达多路段相关延误；车辆块整日重采样保留同日拥堵相关但依赖代表性运行日。</div>
+    </div>
+
+    <div class="grid cards-2" style="margin-top:14px">
+      <div class="card">
+        <h3>📊 周期时间分布审计</h3>
+        <div class="toolbar"><label>线路 <select id="dist-route">${['R1', 'R2', 'R3'].map(r => `<option>${r}</option>`).join('')}</select></label>
+        <button class="btn sm" id="dist-load">加载分布</button></div>
+        <div id="dist-out" class="small muted">常态分布剔除留出/封路观测后按方向给出分位数。</div>
+      </div>
+      <div class="card">
+        <h3>🧾 车辆块与单车次 AVL</h3>
+        <div class="toolbar">
+          <label>车辆块线路 <select id="blk-route">${['R1', 'R2', 'R3'].map(r => `<option>${r}</option>`).join('')}</select></label>
+          <label>日期 <input id="blk-date" type="date" value="2026-08-12"/></label>
+          <button class="btn sm" id="blk-load">查车辆块</button>
+        </div>
+        <div class="toolbar"><input id="avl-trip" placeholder="车次号 如 FT-R1-2026-08-12-007" style="flex:1"/>
+        <button class="btn sm" id="avl-load">查 AVL 四段</button></div>
+        <div id="blk-out" class="small muted">车辆块展示车次链与司机换班；单车次展示运行/恢复/折返/空驶计划与实测秒数。</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>🕘 历史报告留痕</h3>
+      <div class="toolbar"><label>线路 <select id="rep-route">${['R1', 'R2', 'R3'].map(r => `<option>${r}</option>`).join('')}</select></label>
+      <button class="btn sm" id="rep-load">加载报告</button></div>
+      <div id="rep-out" class="small muted">每次分析都持久化，含方法参数与断点 JSON，可供离线审计。</div>
+    </div>`;
+
+  $('#feas-run').addEventListener('click', async () => {
+    const btn = $('#feas-run'); btn.disabled = true; btn.textContent = '分析中…';
+    try {
+      const route = $('#feas-route').value;
+      const fleet = $('#feas-fleet').value;
+      const q = $('#feas-q').value;
+      const h = $('#feas-holdout').value;
+      const qs = new URLSearchParams({ route, fleetSize: fleet, quantile: q });
+      if (h) qs.set('holdoutWeek', h);
+      const d = await guardAction(() => api(`/experiments/${EXP.id}/feasibility/analyze?${qs}`, { method: 'POST' }), '分析完成');
+      $('#feas-results').innerHTML = renderFeasReports(d.reports);
+      $('#feas-run-out').textContent = '已生成并留痕 ' + Object.keys(d.reports).length + ' 份报告';
+    } catch { /* toast */ } finally { btn.disabled = false; btn.textContent = '▶ 运行两方案分析'; }
+  });
+
+  $('#dist-load').addEventListener('click', async () => {
+    const route = $('#dist-route').value;
+    const d = await api(`/experiments/${EXP.id}/feasibility/distribution?route=${route}&quantile=0.9`);
+    const nd = d.normalDistribution || {};
+    $('#dist-out').innerHTML = `
+      <div class="banner red" style="margin:6px 0"><div>剔除样本 <b>${d.excludedSamples}</b>
+      （封路窗口 ${d.closureWindowSamples} · 节庆其他 ${d.festivalOtherSamples}）——封路时段不进常态分布。</div></div>
+      <table class="data"><thead><tr><th>方向</th><th class="num">常态样本</th><th class="num">均值(s)</th>
+      <th class="num">P50</th><th class="num">P90</th><th class="num">P95</th><th class="num">最大</th></tr></thead><tbody>
+      ${Object.entries(nd).map(([dir, x]) => `<tr><td>${dir}</td>
+        <td class="num mono">${x.normalSamples}</td><td class="num mono">${fmt(x.meanSeconds, 0)}</td>
+        <td class="num mono">${fmt(x.p50, 0)}</td><td class="num mono">${fmt(x.p90, 0)}</td>
+        <td class="num mono">${fmt(x.p95, 0)}</td><td class="num mono">${fmt(x.max, 0)}</td></tr>`).join('')}
+      </tbody></table>`;
+  });
+
+  $('#blk-load').addEventListener('click', async () => {
+    const route = $('#blk-route').value, date = $('#blk-date').value;
+    const d = await api(`/experiments/${EXP.id}/feasibility/blocks?route=${route}&date=${date}`);
+    if (!d.length) { $('#blk-out').innerHTML = '<span class="muted">该日期无车辆块</span>'; return; }
+    $('#blk-out').innerHTML = d.map(b => `<div style="margin-bottom:10px">
+      <b>${b.block_code}</b> · ${b.vehicle_code} · 换班 ${b.shift_codes}
+      <table class="data"><thead><tr><th>#</th><th>车次</th><th>方向</th><th>时段</th><th>计划发车</th><th>状态</th><th>司机班</th></tr></thead><tbody>
+      ${(b.trips || []).map(t => `<tr><td class="num">${t.seq_in_block}</td><td class="mono small">${t.trip_code}</td>
+        <td>${t.direction}</td><td>${t.period_band}</td><td class="small">${dt(t.scheduled_departure)}</td>
+        <td>${badge(t.status, t.status === 'LATE' ? 'red' : 'green')}</td><td class="small">${(t.shift_code || '').split('-').slice(-1)[0]}</td></tr>`).join('')}
+      </tbody></table></div>`).join('');
+  });
+
+  $('#avl-load').addEventListener('click', async () => {
+    const code = $('#avl-trip').value.trim();
+    if (!code) return;
+    const d = await api(`/experiments/${EXP.id}/feasibility/trips/${encodeURIComponent(code)}`);
+    const c = d.cycle || {};
+    $('#blk-out').innerHTML = `<div style="margin-top:8px">
+      <b>${code}</b> 块=${d.blockLink.block_code || '—'} / ${d.blockLink.vehicle_code || '—'}
+      ${c.excluded ? badge('留出·不进常态分布（' + (c.exclude_reason || 'FESTIVAL') + '）', 'red') : badge('常态观测', 'green')}
+      <table class="data"><thead><tr><th>分段</th><th>方向</th><th class="num">计划(s)</th><th class="num">实测(s)</th>
+      <th class="num">偏差(s)</th><th>异常</th></tr></thead><tbody>
+      ${(d.segments || []).map(s => `<tr><td>${s.segment_type}</td><td>${s.direction}</td>
+        <td class="num mono">${s.planned_seconds}</td><td class="num mono">${s.observed_seconds}</td>
+        <td class="num mono">${s.observed_seconds - s.planned_seconds}</td>
+        <td>${s.anomaly_flag ? badge(s.anomaly_reason || 'ANOMALY', 'red') : '—'}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="small muted" style="margin-top:6px">周期=${c.cycle_seconds}s = 运行 ${c.running_seconds} + 恢复 ${c.recovery_seconds}
+      + 折返 ${c.turnback_seconds}（空驶 ${c.deadhead_seconds}s 单列）</div></div>`;
+  });
+
+  $('#rep-load').addEventListener('click', async () => {
+    const route = $('#rep-route').value;
+    const d = await api(`/experiments/${EXP.id}/feasibility/reports?route=${route}`);
+    $('#rep-out').innerHTML = `<table class="data"><thead><tr><th>方法</th><th class="num">车队</th><th>留出周</th>
+      <th class="num">按时率</th><th class="num">缺班</th><th class="num">晚点</th><th class="num">最小车队</th><th>结论</th><th>时间</th></tr></thead><tbody>
+      ${d.map(r => `<tr><td>${r.method}</td><td class="num mono">${r.fleet_size}</td>
+        <td>${r.holdout_week ?? '—'}</td><td class="num mono">${pct(r.on_time_rate, 2)}</td>
+        <td class="num mono" style="${r.missed_trips > 0 ? 'color:var(--red);font-weight:700' : ''}">${r.missed_trips}</td>
+        <td class="num mono">${r.late_trips}</td><td class="num mono">${r.peak_vehicles_needed ? r.peak_vehicles_needed : '—'}</td>
+        <td>${r.feasible ? badge('可执行', 'green') : badge('不可执行', 'red')}</td>
+        <td class="small">${dt(r.created_at)}</td></tr>`).join('')}
+      </tbody></table>`;
+  });
+};
+
+function renderFeasReports(reports) {
+  return Object.entries(reports).map(([method, v]) => {
+    const meta = {
+      QUANTILE: ['历史分位数余量法', 'blue', '逐方向独立取分位，易审计；多路段相关延误无法表达'],
+      BLOCK_RESAMPLE: ['车辆块整日重采样法', 'purple', '以运行日为单位整体重放，保留同日拥堵相关；依赖代表性运行日'],
+      HOLDOUT_ACTUAL_REPLAY: ['留出周真实观测重放（地面真值）', 'red', '含临时封路极端周期，仅作对照，不参与任何常态估计']
+    }[method] || [method, 'gray', ''];
+    const bpRows = (v.breakpoints || []).slice(0, 6).map(b => {
+      const m2 = FEAS_BP_META[b.reason] || [b.reason, 'gray'];
+      return `<tr><td>${badge(m2[0], m2[1])}</td><td class="mono small">${b.tripCode}</td>
+        <td>${b.serviceDate}</td><td class="num mono">${fmt(b.delaySeconds, 0)}s</td>
+        <td class="small">${b.detail || ''}</td></tr>`;
+    }).join('');
+    return `<div class="card" style="margin-bottom:12px;border-left:4px solid var(--brand)">
+      <div class="toolbar" style="margin-top:0">
+        <h3 style="margin:0">${meta[0]}</h3>
+        ${v.feasible ? badge('✓ 可执行', 'green') : badge('⛔ 不可执行（缺班）', 'red')}
+      </div>
+      <p class="section-desc small">${meta[1]}</p>
+      <div class="grid cards-4">
+        ${stat('按时完成比例', pct(v.onTimeRate, 2), (v.onTimeTrips || 0) + ' / ' + v.scheduledTrips, v.onTimeRate < 0.99 ? 'amber' : 'green')}
+        ${stat('缺班数', v.missedTrips, 'MISSED 纸面车次丢班', v.missedTrips > 0 ? 'red' : '')}
+        ${stat('晚点班次', v.lateTrips, '未超容忍窗口，未丢班')}
+        ${stat('峰值在用车 / 最小可行车队', v.peakVehiclesNeeded + ' / ' + (v.minFeasibleFleet > 20 ? '>20' : v.minFeasibleFleet), '给定 ' + v.fleetSize + ' 辆车')}
+      </div>
+      ${bpRows ? `<table class="data" style="margin-top:10px"><thead><tr><th>断点原因</th><th>车次</th><th>日期</th><th class="num">延误</th><th>明细</th></tr></thead><tbody>${bpRows}</tbody></table>
+        <div class="small muted" style="margin-top:6px">断点计数：${JSON.stringify(v.breakpointCounts || {})}</div>`
+        : '<div class="small muted" style="margin-top:8px">无断点。</div>'}
     </div>`;
   }).join('');
 }

@@ -160,6 +160,88 @@ for path in ["/v3/api-docs", "/swagger-ui/index.html", "/index.html", "/login.ht
         ok = False
     check(f"可访问 {path}", ok)
 
+# 11. 线路班次可执行性分析
+st, fov = req("GET", "/api/experiments/1/feasibility/overview")
+fleet = {f["route_code"]: f["vehicles"] for f in fov.get("fleet", [])}
+check("可执行性样例：3 线路每线 4 辆车", fleet == {"R1": 4, "R2": 4, "R3": 4}, str(fleet))
+fcounts = {c["table_name"]: c["n"] for c in fov.get("counts", [])}
+check("6 周 AVL 与车辆块已播种", fcounts.get("vehicle_block") == 360
+      and fcounts.get("avl_segment", 0) > 10000 and fcounts.get("cycle_observation") == 5310,
+      str(fcounts))
+check("节庆留出观测存在且非零", fcounts.get("cycle_excluded", 0) > 0)
+
+st, fh = req("GET", "/api/experiments/1/feasibility/holdout")
+hr = {r["route_code"]: r for r in fh.get("routes", [])}
+check("留出周=6 且整周排除（常态样本为 0）", fh.get("holdoutWeek") == 6
+      and all(r["normal_samples"] == 0 and r["excluded_samples"] > 0 for r in hr.values()))
+check("封路窗口只影响 R1/R2 且 R1 极端周期显著", hr["R1"]["closure_samples"] > 0
+      and hr["R3"]["closure_samples"] == 0
+      and hr["R1"]["closure_max_cycle"] > 2400, str(hr))
+
+st, dist = req("GET", "/api/experiments/1/feasibility/distribution?route=R1&quantile=0.9")
+normal_max = max(d["max"] for d in dist["normalDistribution"].values())
+check("封路极端周期不进入常态分布", dist["excludedSamples"] > 0
+      and normal_max < hr["R1"]["closure_max_cycle"],
+      f"normal_max={normal_max} closure_max={hr['R1']['closure_max_cycle']}")
+check("分布审计报告封路/节庆剔除明细", dist["closureWindowSamples"] > 0
+      and dist["festivalOtherSamples"] > 0)
+
+st, an4 = req("POST", "/api/experiments/1/feasibility/analyze?route=R1&fleetSize=4&quantile=0.90")
+r4 = an4["reports"]
+check("4 车常态周：两方案均判定可执行且零缺班",
+      r4["QUANTILE"]["feasible"] is True and r4["BLOCK_RESAMPLE"]["feasible"] is True
+      and r4["QUANTILE"]["missedTrips"] == 0 and r4["BLOCK_RESAMPLE"]["missedTrips"] == 0)
+check("两方案都返回最小可行车队与峰值在用车",
+      2 <= r4["QUANTILE"]["minFeasibleFleet"] <= 4
+      and r4["QUANTILE"]["peakVehiclesNeeded"] <= 4)
+
+st, an3h = req("POST", "/api/experiments/1/feasibility/analyze?route=R1&fleetSize=3&holdoutWeek=6&quantile=0.90")
+r3h = an3h["reports"]
+check("留出周：常态两方案预测可行，但真实封路重放缺班且不可执行",
+      r3h["QUANTILE"]["feasible"] is True and r3h["BLOCK_RESAMPLE"]["feasible"] is True
+      and r3h["HOLDOUT_ACTUAL_REPLAY"]["feasible"] is False
+      and r3h["HOLDOUT_ACTUAL_REPLAY"]["missedTrips"] > 0)
+check("留出周两方案车辆需求出现差异（真实重放要求更多车）",
+      r3h["HOLDOUT_ACTUAL_REPLAY"]["minFeasibleFleet"]
+      > r3h["BLOCK_RESAMPLE"]["minFeasibleFleet"])
+check("封路断点归因到运行超时/车辆周转",
+      set(r3h["HOLDOUT_ACTUAL_REPLAY"]["breakpointCounts"]).intersection(
+          {"FLEET_SHORTAGE", "RUNNING_OVERRUN"}))
+
+st, an2 = req("POST", "/api/experiments/1/feasibility/analyze?route=R1&fleetSize=2&quantile=0.90")
+r2 = an2["reports"]
+check("不足车队：纸面车次齐全但两方案均 feasible=FALSE",
+      r2["QUANTILE"]["feasible"] is False and r2["BLOCK_RESAMPLE"]["feasible"] is False
+      and r2["QUANTILE"]["scheduledTrips"] == r2["BLOCK_RESAMPLE"]["scheduledTrips"]
+      and r2["QUANTILE"]["missedTrips"] > 0 and r2["BLOCK_RESAMPLE"]["missedTrips"] > 0)
+check("不足车队断点包含 FLEET_SHORTAGE",
+      "FLEET_SHORTAGE" in r2["QUANTILE"]["breakpointCounts"]
+      and "FLEET_SHORTAGE" in r2["BLOCK_RESAMPLE"]["breakpointCounts"])
+check("两方案对同一时刻表给出不同缺班数",
+      r2["QUANTILE"]["missedTrips"] != r2["BLOCK_RESAMPLE"]["missedTrips"],
+      f"q={r2['QUANTILE']['missedTrips']} r={r2['BLOCK_RESAMPLE']['missedTrips']}")
+
+st, blocks = req("GET", "/api/experiments/1/feasibility/blocks?route=R1&date=2026-08-12")
+check("封路日 4 个车辆块且块内含司机换班与车次链",
+      len(blocks) == 4 and all(len(b["trips"]) > 5 and "," in b["shift_codes"] for b in blocks))
+
+st, avl = req("GET", "/api/experiments/1/feasibility/trips/FT-R1-2026-08-12-007")
+seg_types = {s["segment_type"] for s in avl["segments"]}
+check("AVL 行程拆成运行/恢复/折返（首末含空驶）",
+      {"RUNNING", "TERMINAL_RECOVERY", "TURNBACK"}.issubset(seg_types))
+check("留出周车次周期观测 excluded=TRUE", avl["cycle"]["excluded"] is True)
+check("车次已连接到车辆块与司机班次",
+      bool(avl["blockLink"].get("block_code")) and bool(avl["blockLink"].get("shift_code")))
+
+st, reps = req("GET", "/api/experiments/1/feasibility/reports?route=R1")
+check("可行性报告已持久化留痕（含量方法与重放）",
+      len(reps) >= 6 and {r["method"] for r in reps}
+      >= {"QUANTILE", "BLOCK_RESAMPLE", "BLOCK_RESAMPLE_REPLAY"})
+
+st, api_docs = req("GET", "/v3/api-docs")
+check("OpenAPI 收录可执行性接口",
+      any("feasibility" in p for p in api_docs.get("paths", {})))
+
 print(f"\n通过 {len(passes)} 项，失败 {len(fails)} 项")
 if fails:
     print("失败项：" + "; ".join(fails))
